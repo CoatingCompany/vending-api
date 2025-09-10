@@ -1,8 +1,8 @@
 import os, time, json
-from typing import Optional, List, Dict, Any
-from fastapi import FastAPI, HTTPException, Header, Query
+from typing import Optional, List, Dict, Any, Union
+from fastapi import FastAPI, HTTPException, Header, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, root_validator
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -84,14 +84,48 @@ def _get_numeric_sheet_id(svc) -> int:
             return _sheet_id_cache
     raise HTTPException(500, f"Tab '{TAB_NAME}' not found to resolve sheetId.")
 
+def _col_letter(n: int) -> str:
+    s = ""
+    while n:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+def _normalize_products_to_string(val: Optional[Union[str, List[str]]]) -> Optional[str]:
+    if val is None:
+        return None
+    if isinstance(val, list):
+        return ", ".join([str(x).strip() for x in val if str(x).strip()])
+    return str(val).strip()
+
 # ---------- models ----------
 
 class AppendRequest(BaseModel):
     location: str
-    product: str
+    # accept either product (string / CSV) or products (string or list); normalize into product
+    product: Optional[Union[str, List[str]]] = None
+    products: Optional[Union[str, List[str]]] = None
     quantity: Optional[int] = None
     note: Optional[str] = None
+    notes: Optional[str] = None
     user: Optional[str] = None
+
+    @root_validator(pre=True)
+    def _merge_fields(cls, v):
+        # prefer 'product' if present, else 'products'
+        prod = v.get("product", None)
+        if prod is None:
+            prod = v.get("products", None)
+        v["product"] = _normalize_products_to_string(prod)
+        # prefer 'note' if present, else 'notes'
+        note = v.get("note", None)
+        if note is None:
+            note = v.get("notes", None)
+        v["note"] = note
+        return v
+
+    class Config:
+        extra = "ignore"
 
 class QueryFilters(BaseModel):
     location: Optional[str] = None
@@ -103,12 +137,31 @@ class QueryFilters(BaseModel):
 class UpdateRowRequest(BaseModel):
     row_number: int = Field(..., ge=2, description="1 = header; data starts at 2")
     location: Optional[str] = None
-    product: Optional[str] = None
+    product: Optional[Union[str, List[str]]] = None
+    products: Optional[Union[str, List[str]]] = None
     quantity: Optional[int] = None
     note: Optional[str] = None
+    notes: Optional[str] = None
     user: Optional[str] = None
     # If you pass timestamp, it replaces the date string; otherwise left as-is
     timestamp: Optional[str] = Field(None, description="DD-MM-YYYY")
+
+    @root_validator(pre=True)
+    def _merge_update_fields(cls, v):
+        # product/products → product (CSV)
+        prod = v.get("product", None)
+        if prod is None:
+            prod = v.get("products", None)
+        v["product"] = _normalize_products_to_string(prod)
+        # note/notes → note
+        note = v.get("note", None)
+        if note is None:
+            note = v.get("notes", None)
+        v["note"] = note
+        return v
+
+    class Config:
+        extra = "ignore"
 
 class DeleteRowRequest(BaseModel):
     row_number: int = Field(..., ge=2, description="1 = header; data starts at 2")
@@ -122,14 +175,17 @@ def health():
 @app.post("/append")
 def append_row(payload: AppendRequest, x_api_key: Optional[str] = Header(None)):
     require_api_key(x_api_key)
+    if not payload.product:
+        raise HTTPException(422, "Field 'product' or 'products' is required.")
+
     svc = sheets_service()
     row = {
         "timestamp": _bg_today_str(),
         "location": payload.location.strip(),
         "product": payload.product.strip(),
         "quantity": "" if payload.quantity is None else str(payload.quantity),
-        "note": "" if not payload.note else payload.note.strip(),
-        "user": "" if not payload.user else payload.user.strip(),
+        "note": "" if not payload.note else str(payload.note).strip(),
+        "user": "" if not payload.user else str(payload.user).strip(),
     }
     values = [[row[k] for k in ROW_ORDER]]
     try:
@@ -229,6 +285,7 @@ def search_rows(filters: QueryFilters, x_api_key: Optional[str] = Header(None)):
 def update_row(patch: UpdateRowRequest, x_api_key: Optional[str] = Header(None)):
     """
     Update any subset of fields on a specific row_number (>= 2).
+    Accepts product/products (string or list) and note/notes.
     """
     require_api_key(x_api_key)
     svc = sheets_service()
@@ -241,10 +298,15 @@ def update_row(patch: UpdateRowRequest, x_api_key: Optional[str] = Header(None))
     if not values or patch.row_number < 2 or patch.row_number > len(values):
         raise HTTPException(404, f"Row {patch.row_number} not found.")
 
-    existing = values[patch.row_number - 1]  # 0-based in list
-    # Build merged row dict
+    for k in ROW_ORDER:
+        if k not in idx:
+            raise HTTPException(500, f"Sheet header must include: {ROW_ORDER}")
+
+    existing = values[patch.row_number - 1]  # 0-based
+    # Build merged row dict aligned to header
     current: Dict[str, Any] = {k: (existing[idx[k]] if idx[k] < len(existing) else "") for k in ROW_ORDER}
-    # Apply patch
+
+    # Apply patch (normalized fields already in patch.model)
     if patch.timestamp is not None: current["timestamp"] = patch.timestamp
     if patch.location  is not None: current["location"]  = patch.location
     if patch.product   is not None: current["product"]   = patch.product
@@ -252,8 +314,10 @@ def update_row(patch: UpdateRowRequest, x_api_key: Optional[str] = Header(None))
     if patch.note      is not None: current["note"]      = patch.note
     if patch.user      is not None: current["user"]      = patch.user
 
-    # Write back to the row
-    a1 = f"{TAB_NAME}!A{patch.row_number}:F{patch.row_number}"
+    # Compute the target range using the actual number of header columns
+    last_col_letter = _col_letter(len(ROW_ORDER))
+    a1 = f"{TAB_NAME}!A{patch.row_number}:{last_col_letter}{patch.row_number}"
+
     try:
         svc.spreadsheets().values().update(
             spreadsheetId=SHEET_ID,
@@ -264,7 +328,22 @@ def update_row(patch: UpdateRowRequest, x_api_key: Optional[str] = Header(None))
     except HttpError as e:
         raise HTTPException(502, detail=f"Google API error (update): {e}")
 
-    return {"ok": True, "row_number": patch.row_number, "row": current}
+    # Read-after-write verification; return the actual row contents
+    try:
+        new_values = svc.spreadsheets().values().get(
+            spreadsheetId=SHEET_ID,
+            range=f"{TAB_NAME}!A{patch.row_number}:{last_col_letter}{patch.row_number}"
+        ).execute().get("values", [[]])
+    except HttpError as e:
+        raise HTTPException(502, detail=f"Google API error (verify): {e}")
+
+    new_row = new_values[0] if new_values else []
+    # pad
+    if len(new_row) < len(ROW_ORDER):
+        new_row += [""] * (len(ROW_ORDER) - len(new_row))
+    returned = {ROW_ORDER[i]: new_row[i] for i in range(len(ROW_ORDER))}
+
+    return {"ok": True, "row_number": patch.row_number, "row": returned}
 
 @app.post("/delete-row")
 def delete_row(req: DeleteRowRequest, x_api_key: Optional[str] = Header(None)):
