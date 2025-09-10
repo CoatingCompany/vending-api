@@ -10,7 +10,10 @@ from dotenv import load_dotenv
 from datetime import datetime
 import zoneinfo
 import re
+from fastapi.routing import APIRoute
+import logging
 
+app = FastAPI(title="Wonder Toys Sheets API (BG columns)", version="2.1.0")
 # ------------------ env ------------------
 
 load_dotenv()
@@ -218,6 +221,10 @@ class DeleteRowRequest(BaseModel):
     row_number: int = Field(..., ge=2, description="1 = header; data starts at 2")
 
 # ------------------ endpoints ------------------
+@app.on_event("startup")
+def log_routes():
+    paths = [r.path for r in app.routes if isinstance(r, APIRoute)]
+    logging.getLogger("uvicorn").info(f"ROUTES: {paths}")
 
 @app.get("/health")
 def health():
