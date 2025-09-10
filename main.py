@@ -1,4 +1,4 @@
-import os, json
+import os, json, re
 from typing import Optional, List, Dict, Any, Union
 from fastapi import FastAPI, HTTPException, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,13 +7,9 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from dotenv import load_dotenv
-from datetime import datetime
+from datetime import datetime, timedelta
 import zoneinfo
-import re
-from fastapi.routing import APIRoute
-import logging
 
-app = FastAPI(title="Wonder Toys Sheets API (BG columns)", version="2.1.0")
 # ------------------ env ------------------
 
 load_dotenv()
@@ -26,7 +22,6 @@ TIMEZONE = os.environ.get("TIMEZONE", "Europe/Sofia")
 
 # ------------------ localization (BG headers) ------------------
 
-# Column name mapping (Sheet row 1 must match these exactly)
 COL = {
     "timestamp": "Дата",
     "location":  "Локация",
@@ -34,13 +29,11 @@ COL = {
     "note":      "Бележка",
     "revenue":   "Оборот",
 }
-
-# Order of columns in the sheet
 ROW_ORDER = [COL["timestamp"], COL["location"], COL["items"], COL["note"], COL["revenue"]]
 
 # ------------------ app ------------------
 
-app = FastAPI(title="Wonder Toys Sheets API (BG columns)")
+app = FastAPI(title="Wonder Toys Sheets API (BG columns)", version="2.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
@@ -48,28 +41,11 @@ app.add_middleware(
 
 # ------------------ helpers ------------------
 
-def _row_with_aliases(row_map: Dict[str, str]) -> Dict[str, Any]:
-    """
-    Add ASCII aliases to a BG-keyed row map so the assistant can aggregate.
-    Provides: timestamp, location, items_en, note_en, revenue (int).
-    """
-    out = dict(row_map)  # keep BG keys
-    out["timestamp"] = row_map.get(COL["timestamp"], "")
-    out["location"]  = row_map.get(COL["location"], "")
-    out["items_en"]  = row_map.get(COL["items"], "")
-    out["note_en"]   = row_map.get(COL["note"], "")
-    rev = row_map.get(COL["revenue"], "")
-    try:
-        out["revenue"] = int(str(rev).strip()) if str(rev).strip() != "" else 0
-    except:
-        out["revenue"] = 0
-    return out
-
+_tz = zoneinfo.ZoneInfo(TIMEZONE)
 _sheet_id_cache: Optional[int] = None  # numeric sheet/tab id
 
 def _bg_today_str() -> str:
-    tz = zoneinfo.ZoneInfo(TIMEZONE)
-    return datetime.now(tz).strftime("%d-%m-%Y")  # DD-MM-YYYY
+    return datetime.now(_tz).strftime("%d-%m-%Y")  # DD-MM-YYYY
 
 def _validate_date_ddmmyyyy(value: str) -> str:
     try:
@@ -78,14 +54,69 @@ def _validate_date_ddmmyyyy(value: str) -> str:
         raise HTTPException(422, detail="Невалидна дата. Използвайте формат DD-MM-YYYY.")
     return value
 
-def _validate_int_or_empty(value: Optional[Union[int, str]]) -> str:
-    """Оборот: допуска само цели числа или празно."""
-    if value is None or str(value).strip() == "":
-        return ""
-    s = str(value).strip()
-    if not re.fullmatch(r"-?\d+", s):
-        raise HTTPException(422, detail="Оборот трябва да е цяло число без десетични точки.")
-    return s
+def _parse_int_loose(value: Any) -> int:
+    """Extract a whole number from '1 200', '1,200', 'лв 120', etc."""
+    if value is None:
+        return 0
+    s = str(value)
+    s = s.replace("\u00A0", " ").replace("\u2009", " ").replace("\u202F", " ")
+    s_nogroup = s.replace(",", "").replace(" ", "")
+    m = re.search(r'[-+]?\d+', s_nogroup) or re.search(r'[-+]?\d+', s)
+    return int(m.group(0)) if m else 0
+
+def _excel_serial_to_epoch(serial: Union[int, float]) -> float:
+    """Excel serial → epoch seconds (midnight local). Excel's day 0 is 1899-12-30."""
+    try:
+        d = datetime(1899, 12, 30, tzinfo=_tz) + timedelta(days=float(serial))
+        # normalize to date (strip time if any)
+        d = datetime(d.year, d.month, d.day, tzinfo=_tz)
+        return d.timestamp()
+    except Exception:
+        return None  # type: ignore
+
+_DATE_PATTERNS = [
+    "%d-%m-%Y",
+    "%d.%m.%Y",
+    "%d/%m/%Y",
+    "%Y-%m-%d",
+]
+
+def _cell_date_to_epoch(cell: Any) -> Optional[float]:
+    """Accept Excel serials or various string formats; return epoch seconds or None."""
+    if cell is None or cell == "":
+        return None
+    # numeric serial?
+    if isinstance(cell, (int, float)) and not isinstance(cell, bool):
+        return _excel_serial_to_epoch(cell)
+    s = str(cell).strip()
+    if s == "":
+        return None
+    # try patterns
+    for fmt in _DATE_PATTERNS:
+        try:
+            dt = datetime.strptime(s, fmt)
+            dt = datetime(dt.year, dt.month, dt.day, tzinfo=_tz)
+            return dt.timestamp()
+        except Exception:
+            pass
+    # try to normalize separators (e.g., dd-mm-yyyy with mixed dash types)
+    s2 = re.sub(r"[.\-/]", "-", s)
+    try:
+        dt = datetime.strptime(s2, "%d-%m-%Y")
+        dt = datetime(dt.year, dt.month, dt.day, tzinfo=_tz)
+        return dt.timestamp()
+    except Exception:
+        return None
+
+def _row_with_aliases(row_map: Dict[str, Any]) -> Dict[str, Any]:
+    """Add ASCII aliases so the assistant can aggregate."""
+    out = dict(row_map)  # keep BG keys
+    out["timestamp"] = row_map.get(COL["timestamp"], "")
+    out["location"]  = row_map.get(COL["location"], "")
+    out["items_en"]  = row_map.get(COL["items"], "")
+    out["note_en"]   = row_map.get(COL["note"], "")
+    out["revenue"]   = _parse_int_loose(row_map.get(COL["revenue"], ""))
+    return out
 
 def sheets_service():
     svc_json = os.environ.get("SERVICE_ACCOUNT_JSON")
@@ -118,9 +149,16 @@ def _sheet_range_all_cols() -> str:
     last = _col_letter(len(ROW_ORDER))  # A..E
     return f"{TAB_NAME}!A:{last}"
 
-def _get_values_and_index(svc) -> tuple[List[List[str]], Dict[str, int]]:
+def _get_values_and_index(svc, value_render="UNFORMATTED_VALUE") -> tuple[List[List[Any]], Dict[str, int]]:
+    """
+    Use UNFORMATTED_VALUE so dates come as numbers when the cell is a true date.
+    We'll parse both numbers and strings in _cell_date_to_epoch.
+    """
     values = svc.spreadsheets().values().get(
-        spreadsheetId=SHEET_ID, range=_sheet_range_all_cols()
+        spreadsheetId=SHEET_ID,
+        range=_sheet_range_all_cols(),
+        valueRenderOption=value_render,
+        dateTimeRenderOption="FORMATTED_STRING",
     ).execute().get("values", [])
     if not values or len(values) < 1:
         return [], {}
@@ -136,27 +174,6 @@ def _require_header(idx: Dict[str, int]):
                 detail=f"Липсваща колона в заглавния ред. Очаква се точно: {ROW_ORDER}"
             )
 
-def _ts_to_epoch_ddmmyyyy(s: str) -> float:
-    try:
-        return datetime.strptime(s, "%d-%м-%Y").timestamp()
-    except Exception:
-        # fallback if locale char differs
-        try:
-            return datetime.strptime(s, "%d-%m-%Y").timestamp()
-        except Exception:
-            return -1.0
-
-# ------------ normalization (compat) ------------
-
-def _norm_items_to_string(val: Optional[Union[str, List[str]]]) -> Optional[str]:
-    """Консумативи: приемаме 'a, b' или ['a','b'] → 'a, b'."""
-    if val is None:
-        return None
-    if isinstance(val, list):
-        parts = [str(x).strip() for x in val if str(x).strip()]
-        return ", ".join(parts)
-    return str(val).strip()
-
 # ------------------ models ------------------
 
 class AppendRequest(BaseModel):
@@ -165,28 +182,23 @@ class AppendRequest(BaseModel):
     note: Optional[str] = None
     revenue: Optional[Union[int, str]] = Field(None, description="цяло число")
     timestamp: Optional[str] = Field(None, description="DD-MM-YYYY")
-
-    # compatibility with older prompts / schema
+    # legacy
     product: Optional[str] = None
     products: Optional[Union[str, List[str]]] = None
     notes: Optional[str] = None
-
     @root_validator(pre=True)
     def _merge_legacy(cls, v):
         if v.get("items") is None:
-            prod = v.get("product")
             prods = v.get("products")
-            if prods is not None:
-                v["items"] = prods
-            elif prod is not None:
-                v["items"] = prod
+            prod = v.get("product")
+            v["items"] = prods if prods is not None else prod
         if v.get("note") is None and v.get("notes") is not None:
             v["note"] = v["notes"]
         return v
 
 class QueryFilters(BaseModel):
     location: Optional[str] = None
-    product: Optional[str] = None  # matches item token equal (case-insensitive)
+    product: Optional[str] = None
     since_ts: Optional[float] = Field(None, description="UNIX timestamp lower bound")
     until_ts: Optional[float] = Field(None, description="UNIX timestamp upper bound")
     limit: Optional[int] = Field(50, ge=1, le=500)
@@ -198,21 +210,16 @@ class UpdateRowRequest(BaseModel):
     note: Optional[str] = None
     revenue: Optional[Union[int, str]] = None
     timestamp: Optional[str] = Field(None, description="DD-MM-YYYY")
-
     # legacy aliases
     product: Optional[str] = None
     products: Optional[Union[str, List[str]]] = None
     notes: Optional[str] = None
-
     @root_validator(pre=True)
     def _merge_legacy(cls, v):
         if v.get("items") is None:
-            prod = v.get("product")
             prods = v.get("products")
-            if prods is not None:
-                v["items"] = prods
-            elif prod is not None:
-                v["items"] = prod
+            prod = v.get("product")
+            v["items"] = prods if prods is not None else prod
         if v.get("note") is None and v.get("notes") is not None:
             v["note"] = v["notes"]
         return v
@@ -221,14 +228,10 @@ class DeleteRowRequest(BaseModel):
     row_number: int = Field(..., ge=2, description="1 = header; data starts at 2")
 
 # ------------------ endpoints ------------------
-@app.on_event("startup")
-def log_routes():
-    paths = [r.path for r in app.routes if isinstance(r, APIRoute)]
-    logging.getLogger("uvicorn").info(f"ROUTES: {paths}")
 
 @app.get("/health")
 def health():
-    return {"ok": True, "tz": TIMEZONE, "date_format": "DD-MM-YYYY", "columns": ROW_ORDER}
+    return {"ok": True, "tz": TIMEZONE, "date_format": "DD-MM-YYYY", "columns": ROW_ORDER, "version": app.version}
 
 @app.post("/append")
 def append_row(payload: AppendRequest, x_api_key: Optional[str] = Header(None)):
@@ -238,11 +241,16 @@ def append_row(payload: AppendRequest, x_api_key: Optional[str] = Header(None)):
     date_str = payload.timestamp.strip() if payload.timestamp else _bg_today_str()
     _validate_date_ddmmyyyy(date_str)
 
-    items_str = _norm_items_to_string(payload.items)
+    # normalize items
+    if isinstance(payload.items, list):
+        items_str = ", ".join([str(x).strip() for x in payload.items if str(x).strip()])
+    else:
+        items_str = (payload.items or payload.product or "") if payload.items or payload.product else ""
+        items_str = str(items_str).strip()
     if not items_str:
         raise HTTPException(422, detail="Задължително поле: консумативи (items).")
 
-    revenue_str = _validate_int_or_empty(payload.revenue)
+    revenue_str = str(_parse_int_loose(payload.revenue)) if payload.revenue not in (None, "") else ""
 
     row = {
         COL["timestamp"]: date_str,
@@ -262,10 +270,9 @@ def append_row(payload: AppendRequest, x_api_key: Optional[str] = Header(None)):
         ).execute()
     except HttpError as e:
         raise HTTPException(502, detail=f"Google API error (append): {e}")
-    # return with aliases so the assistant can aggregate revenue
     return {"ok": True, "row": _row_with_aliases(row), "update": result}
 
-@app.get("/last-product")  # keeping path for compatibility; returns last consumables
+@app.get("/last-product")  # returns latest entry (by date) for a location
 def last_product(location: str = Query(...), x_api_key: Optional[str] = Header(None)):
     require_api_key(x_api_key)
     svc = sheets_service()
@@ -280,24 +287,40 @@ def last_product(location: str = Query(...), x_api_key: Optional[str] = Header(N
 
     loc = location.strip().lower()
     rows = values[1:]
-    matches = [r for r in rows if len(r) > idx[COL["location"]] and r[idx[COL["location"]]].strip().lower() == loc]
-    if not matches:
-        raise HTTPException(404, f"Няма редове за локация '{location}'.")
+    matches: List[tuple[float, List[Any], int]] = []
+    for i, r in enumerate(rows, start=2):
+        if len(r) > idx[COL["location"]] and str(r[idx[COL["location"]]]).strip().lower() == loc:
+            epoch = _cell_date_to_epoch(r[idx[COL["timestamp"]]] if idx[COL["timestamp"]] < len(r) else "")
+            if epoch is not None:
+                matches.append((epoch, r, i))
 
-    last_row = max(matches, key=lambda r: _ts_to_epoch_ddmmyyyy(r[idx[COL["timestamp"]]] if idx[COL["timestamp"]] < len(r) else ""))
+    if matches:
+        # pick by max epoch
+        epoch, last_row, rownum = max(matches, key=lambda t: t[0])
+    else:
+        # fallback: last occurrence by row order
+        fallback = None
+        for i, r in enumerate(rows, start=2):
+            if len(r) > idx[COL["location"]] and str(r[idx[COL["location"]]]).strip().lower() == loc:
+                fallback = (r, i)
+        if not fallback:
+            raise HTTPException(404, f"Няма редове за локация '{location}'.")
+        last_row, rownum = fallback
+
     def get(colkey):
         c = COL[colkey]
         return last_row[idx[c]] if idx[c] < len(last_row) else ""
 
     items_raw = get("items") or ""
-    items = [p.strip() for p in items_raw.split(",") if p.strip()]
+    items = [p.strip() for p in str(items_raw).split(",") if p.strip()]
     return {
         "location": location,
-        "timestamp": get("timestamp"),
+        "timestamp": str(get("timestamp")),
         "items": items,
         "last_item": (items[-1] if items else ""),
-        "note": get("note"),
-        "revenue": get("revenue"),
+        "note": str(get("note")),
+        "revenue": str(get("revenue")),
+        "row_number": rownum,
     }
 
 @app.post("/search")
@@ -317,26 +340,26 @@ def search_rows(filters: QueryFilters, x_api_key: Optional[str] = Header(None)):
         def get(colkey):
             c = COL[colkey]
             return r[idx[c]] if idx[c] < len(r) else ""
-        if filters.location and get("location").strip().lower() != filters.location.strip().lower():
+        if filters.location and str(get("location")).strip().lower() != filters.location.strip().lower():
             return False
         if filters.product:
-            # exact token match (case-insensitive) in "Консумативи"
             prod = filters.product.strip().lower()
-            tokens = [p.strip().lower() for p in (get("items") or "").split(",") if p.strip()]
+            tokens = [p.strip().lower() for p in str(get("items")).split(",") if p.strip()]
             if prod not in tokens:
                 return False
         if filters.since_ts or filters.until_ts:
-            ts_val = _ts_to_epoch_ddmmyyyy(get("timestamp"))
-            if ts_val < 0:
+            ts_val = _cell_date_to_epoch(get("timestamp"))
+            # if we cannot parse the date, exclude from date-filtered queries
+            if ts_val is None:
                 return False
-            if filters.since_ts and ts_val < filters.since_ts: return False
-            if filters.until_ts and ts_val > filters.until_ts: return False
+            if filters.since_ts and ts_val < float(filters.since_ts): return False
+            if filters.until_ts and ts_val > float(filters.until_ts): return False
         return True
 
     out = []
     for i, r in enumerate(values[1:], start=2):
         if ok(r):
-            obj_bg = {col: (r[idx[col]] if idx[col] < len(r) else "") for col in ROW_ORDER}
+            obj_bg: Dict[str, Any] = {col: (r[idx[col]] if idx[col] < len(r) else "") for col in ROW_ORDER}
             obj_bg["row_number"] = i
             out.append(_row_with_aliases(obj_bg))
             if len(out) >= (filters.limit or 50): break
@@ -344,9 +367,6 @@ def search_rows(filters: QueryFilters, x_api_key: Optional[str] = Header(None)):
 
 @app.post("/update-row")
 def update_row(patch: UpdateRowRequest, x_api_key: Optional[str] = Header(None)):
-    """
-    Частичен update на ред (row_number >= 2).
-    """
     require_api_key(x_api_key)
     svc = sheets_service()
 
@@ -366,14 +386,17 @@ def update_row(patch: UpdateRowRequest, x_api_key: Optional[str] = Header(None))
     if patch.location is not None:
         current[COL["location"]] = patch.location.strip()
     if patch.items is not None:
-        items_str = _norm_items_to_string(patch.items)
+        if isinstance(patch.items, list):
+            items_str = ", ".join([str(x).strip() for x in patch.items if str(x).strip()])
+        else:
+            items_str = str(patch.items).strip()
         if not items_str:
             raise HTTPException(422, detail="Невалидни консумативи.")
         current[COL["items"]] = items_str
     if patch.note is not None:
         current[COL["note"]] = str(patch.note).strip()
     if patch.revenue is not None:
-        current[COL["revenue"]] = _validate_int_or_empty(patch.revenue)
+        current[COL["revenue"]] = str(_parse_int_loose(patch.revenue)) if str(patch.revenue).strip() != "" else ""
 
     last_col_letter = _col_letter(len(ROW_ORDER))
     a1 = f"{TAB_NAME}!A{patch.row_number}:{last_col_letter}{patch.row_number}"
@@ -390,7 +413,10 @@ def update_row(patch: UpdateRowRequest, x_api_key: Optional[str] = Header(None))
     # read-after-write
     try:
         new_vals = svc.spreadsheets().values().get(
-            spreadsheetId=SHEET_ID, range=a1
+            spreadsheetId=SHEET_ID,
+            range=a1,
+            valueRenderOption="UNFORMATTED_VALUE",
+            dateTimeRenderOption="FORMATTED_STRING",
         ).execute().get("values", [[]])
     except HttpError as e:
         raise HTTPException(502, detail=f"Google API error (verify): {e}")
@@ -400,14 +426,10 @@ def update_row(patch: UpdateRowRequest, x_api_key: Optional[str] = Header(None))
         row += [""] * (len(ROW_ORDER) - len(row))
     returned = {ROW_ORDER[i]: row[i] for i in range(len(ROW_ORDER))}
     returned["row_number"] = patch.row_number
-    # return with aliases so the assistant can aggregate revenue
     return {"ok": True, "row": _row_with_aliases(returned)}
 
 @app.post("/delete-row")
 def delete_row(req: DeleteRowRequest, x_api_key: Optional[str] = Header(None)):
-    """
-    Изтриване на конкретен ред (>= 2).
-    """
     require_api_key(x_api_key)
     svc = sheets_service()
 
@@ -419,7 +441,6 @@ def delete_row(req: DeleteRowRequest, x_api_key: Optional[str] = Header(None)):
         raise HTTPException(404, f"Ред {req.row_number} не е намерен.")
 
     try:
-        # physical delete (same as before)
         meta = svc.spreadsheets().get(spreadsheetId=SHEET_ID).execute()
         sheet_id = None
         for sh in meta.get("sheets", []):
@@ -449,7 +470,7 @@ def delete_row(req: DeleteRowRequest, x_api_key: Optional[str] = Header(None)):
 
     return {"ok": True, "deleted_row_number": req.row_number}
 
-# ------------------ NEW: sum revenue ------------------
+# ------------------ sum revenue ------------------
 
 @app.get("/sum-revenue")
 def sum_revenue(
@@ -480,23 +501,18 @@ def sum_revenue(
 
     for r in values[1:]:
         if location:
-            if get_val(r, "location").strip().lower() != location.strip().lower():
+            if str(get_val(r, "location")).strip().lower() != location.strip().lower():
                 continue
         if since_ts or until_ts:
-            try:
-                ts_val = datetime.strptime(get_val(r, "timestamp"), "%d-%m-%Y").timestamp()
-            except:
+            ts_val = _cell_date_to_epoch(get_val(r, "timestamp"))
+            if ts_val is None:  # cannot evaluate date → exclude from a date-filtered sum
                 continue
             if since_ts and ts_val < since_ts:
                 continue
             if until_ts and ts_val > until_ts:
                 continue
-
         rev_raw = get_val(r, "revenue")
-        try:
-            total += int(str(rev_raw).strip())
-        except:
-            pass
+        total += _parse_int_loose(rev_raw)
         rows_count += 1
 
     return {"total_revenue": total, "rows": rows_count}
