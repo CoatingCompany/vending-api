@@ -1,6 +1,6 @@
-import os, time, json
+import os, json
 from typing import Optional, List, Dict, Any, Union
-from fastapi import FastAPI, HTTPException, Header, Query, Request
+from fastapi import FastAPI, HTTPException, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, root_validator
 from google.oauth2 import service_account
@@ -9,8 +9,10 @@ from googleapiclient.errors import HttpError
 from dotenv import load_dotenv
 from datetime import datetime
 import zoneinfo
+import re
 
-# Load .env if present (local dev); on Render the env is provided by Settings → Environment
+# ------------------ env ------------------
+
 load_dotenv()
 
 SHEET_ID = os.environ.get("SHEET_ID")
@@ -19,16 +21,29 @@ API_KEY  = os.environ.get("API_KEY")
 SCOPES   = ["https://www.googleapis.com/auth/spreadsheets"]
 TIMEZONE = os.environ.get("TIMEZONE", "Europe/Sofia")
 
-# sheet columns order (must match header row in the sheet)
-ROW_ORDER = ["timestamp", "location", "product", "quantity", "note", "user"]
+# ------------------ localization (BG headers) ------------------
 
-app = FastAPI(title="Wonder Toys Sheets API")
+# Column name mapping (Sheet row 1 must match these exactly)
+COL = {
+    "timestamp": "Дата",
+    "location":  "Локация",
+    "items":     "Консумативи",
+    "note":      "Бележка",
+    "revenue":   "Оборот",
+}
+
+# Order of columns in the sheet
+ROW_ORDER = [COL["timestamp"], COL["location"], COL["items"], COL["note"], COL["revenue"]]
+
+# ------------------ app ------------------
+
+app = FastAPI(title="Wonder Toys Sheets API (BG columns)")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )
 
-# ---------- helpers ----------
+# ------------------ helpers ------------------
 
 _sheet_id_cache: Optional[int] = None  # numeric sheet/tab id
 
@@ -36,13 +51,27 @@ def _bg_today_str() -> str:
     tz = zoneinfo.ZoneInfo(TIMEZONE)
     return datetime.now(tz).strftime("%d-%m-%Y")  # DD-MM-YYYY
 
+def _validate_date_ddmmyyyy(value: str) -> str:
+    try:
+        datetime.strptime(value, "%d-%m-%Y")
+    except Exception:
+        raise HTTPException(422, detail="Невалидна дата. Използвайте формат DD-MM-YYYY.")
+    return value
+
+def _validate_int_or_empty(value: Optional[Union[int, str]]) -> str:
+    """Оборот: допуска само цели числа или празно."""
+    if value is None or str(value).strip() == "":
+        return ""
+    s = str(value).strip()
+    if not re.fullmatch(r"-?\d+", s):
+        raise HTTPException(422, detail="Оборот трябва да е цяло число без десетични точки.")
+    return s
+
 def sheets_service():
-    # Either SERVICE_ACCOUNT_JSON (full JSON text) OR SERVICE_ACCOUNT_FILE (path) must be set
     svc_json = os.environ.get("SERVICE_ACCOUNT_JSON")
     svc_file = os.environ.get("SERVICE_ACCOUNT_FILE")
     if not svc_json and not svc_file:
         raise RuntimeError("Provide SERVICE_ACCOUNT_JSON or SERVICE_ACCOUNT_FILE.")
-
     if svc_json:
         info = json.loads(svc_json)
         creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
@@ -50,7 +79,6 @@ def sheets_service():
         if not os.path.exists(svc_file):
             raise RuntimeError(f"SERVICE_ACCOUNT_FILE not found at: {svc_file}")
         creds = service_account.Credentials.from_service_account_file(svc_file, scopes=SCOPES)
-
     return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
 def require_api_key(x_api_key: Optional[str]):
@@ -59,31 +87,6 @@ def require_api_key(x_api_key: Optional[str]):
     if x_api_key != API_KEY:
         raise HTTPException(401, "Invalid API key.")
 
-def a1_range_for_tab(tab: str, start_col="A", end_col="F"):
-    return f"{tab}!{start_col}:{end_col}"
-
-def _get_values_and_index(svc) -> tuple[list[list[str]], Dict[str, int]]:
-    """Return (values, header-index-map) for TAB_NAME."""
-    values = svc.spreadsheets().values().get(
-        spreadsheetId=SHEET_ID, range=a1_range_for_tab(TAB_NAME)
-    ).execute().get("values", [])
-    if not values or len(values) < 1:
-        return [], {}
-    header = values[0]
-    idx = {name: i for i, name in enumerate(header)}
-    return values, idx
-
-def _get_numeric_sheet_id(svc) -> int:
-    global _sheet_id_cache
-    if _sheet_id_cache is not None:
-        return _sheet_id_cache
-    meta = svc.spreadsheets().get(spreadsheetId=SHEET_ID).execute()
-    for sh in meta.get("sheets", []):
-        if sh["properties"]["title"] == TAB_NAME:
-            _sheet_id_cache = sh["properties"]["sheetId"]
-            return _sheet_id_cache
-    raise HTTPException(500, f"Tab '{TAB_NAME}' not found to resolve sheetId.")
-
 def _col_letter(n: int) -> str:
     s = ""
     while n:
@@ -91,45 +94,77 @@ def _col_letter(n: int) -> str:
         s = chr(65 + r) + s
     return s
 
-def _normalize_products_to_string(val: Optional[Union[str, List[str]]]) -> Optional[str]:
+def _sheet_range_all_cols() -> str:
+    last = _col_letter(len(ROW_ORDER))  # A..E
+    return f"{TAB_NAME}!A:{last}"
+
+def _get_values_and_index(svc) -> tuple[List[List[str]], Dict[str, int]]:
+    values = svc.spreadsheets().values().get(
+        spreadsheetId=SHEET_ID, range=_sheet_range_all_cols()
+    ).execute().get("values", [])
+    if not values or len(values) < 1:
+        return [], {}
+    header = values[0]
+    idx = {name: i for i, name in enumerate(header)}
+    return values, idx
+
+def _require_header(idx: Dict[str, int]):
+    for k in ROW_ORDER:
+        if k not in idx:
+            raise HTTPException(
+                500,
+                detail=f"Липсваща колона в заглавния ред. Очаква се точно: {ROW_ORDER}"
+            )
+
+def _ts_to_epoch_ddmmyyyy(s: str) -> float:
+    try:
+        return datetime.strptime(s, "%d-%m-%Y").timestamp()
+    except Exception:
+        return -1.0
+
+# ------------ normalization (compat) ------------
+
+def _norm_items_to_string(val: Optional[Union[str, List[str]]]) -> Optional[str]:
+    """Консумативи: приемаме 'a, b' или ['a','b'] → 'a, b'."""
     if val is None:
         return None
     if isinstance(val, list):
-        return ", ".join([str(x).strip() for x in val if str(x).strip()])
+        parts = [str(x).strip() for x in val if str(x).strip()]
+        return ", ".join(parts)
     return str(val).strip()
 
-# ---------- models ----------
+# ------------------ models ------------------
 
 class AppendRequest(BaseModel):
     location: str
-    # accept either product (string / CSV) or products (string or list); normalize into product
-    product: Optional[Union[str, List[str]]] = None
-    products: Optional[Union[str, List[str]]] = None
-    quantity: Optional[int] = None
+    # new canonical
+    items: Optional[Union[str, List[str]]] = None
     note: Optional[str] = None
+    revenue: Optional[Union[int, str]] = Field(None, description="цяло число")
+    timestamp: Optional[str] = Field(None, description="DD-MM-YYYY")
+
+    # compatibility with older prompts / schema
+    product: Optional[str] = None
+    products: Optional[Union[str, List[str]]] = None
     notes: Optional[str] = None
-    user: Optional[str] = None
 
     @root_validator(pre=True)
-    def _merge_fields(cls, v):
-        # prefer 'product' if present, else 'products'
-        prod = v.get("product", None)
-        if prod is None:
-            prod = v.get("products", None)
-        v["product"] = _normalize_products_to_string(prod)
-        # prefer 'note' if present, else 'notes'
-        note = v.get("note", None)
-        if note is None:
-            note = v.get("notes", None)
-        v["note"] = note
+    def _merge_legacy(cls, v):
+        if v.get("items") is None:
+            # prefer 'product'/'products'
+            prod = v.get("product")
+            prods = v.get("products")
+            if prods is not None:
+                v["items"] = prods
+            elif prod is not None:
+                v["items"] = prod
+        if v.get("note") is None and v.get("notes") is not None:
+            v["note"] = v["notes"]
         return v
-
-    class Config:
-        extra = "ignore"
 
 class QueryFilters(BaseModel):
     location: Optional[str] = None
-    product: Optional[str] = None
+    product: Optional[str] = None  # matches item token equal (case-insensitive)
     since_ts: Optional[float] = Field(None, description="UNIX timestamp lower bound")
     until_ts: Optional[float] = Field(None, description="UNIX timestamp upper bound")
     limit: Optional[int] = Field(50, ge=1, le=500)
@@ -137,70 +172,73 @@ class QueryFilters(BaseModel):
 class UpdateRowRequest(BaseModel):
     row_number: int = Field(..., ge=2, description="1 = header; data starts at 2")
     location: Optional[str] = None
-    product: Optional[Union[str, List[str]]] = None
-    products: Optional[Union[str, List[str]]] = None
-    quantity: Optional[int] = None
+    items: Optional[Union[str, List[str]]] = None
     note: Optional[str] = None
-    notes: Optional[str] = None
-    user: Optional[str] = None
-    # If you pass timestamp, it replaces the date string; otherwise left as-is
+    revenue: Optional[Union[int, str]] = None
     timestamp: Optional[str] = Field(None, description="DD-MM-YYYY")
 
-    @root_validator(pre=True)
-    def _merge_update_fields(cls, v):
-        # product/products → product (CSV)
-        prod = v.get("product", None)
-        if prod is None:
-            prod = v.get("products", None)
-        v["product"] = _normalize_products_to_string(prod)
-        # note/notes → note
-        note = v.get("note", None)
-        if note is None:
-            note = v.get("notes", None)
-        v["note"] = note
-        return v
+    # legacy aliases
+    product: Optional[str] = None
+    products: Optional[Union[str, List[str]]] = None
+    notes: Optional[str] = None
 
-    class Config:
-        extra = "ignore"
+    @root_validator(pre=True)
+    def _merge_legacy(cls, v):
+        if v.get("items") is None:
+            prod = v.get("product")
+            prods = v.get("products")
+            if prods is not None:
+                v["items"] = prods
+            elif prod is not None:
+                v["items"] = prod
+        if v.get("note") is None and v.get("notes") is not None:
+            v["note"] = v["notes"]
+        return v
 
 class DeleteRowRequest(BaseModel):
     row_number: int = Field(..., ge=2, description="1 = header; data starts at 2")
 
-# ---------- endpoints ----------
+# ------------------ endpoints ------------------
 
 @app.get("/health")
 def health():
-    return {"ok": True, "tz": TIMEZONE, "date_format": "DD-MM-YYYY"}
+    return {"ok": True, "tz": TIMEZONE, "date_format": "DD-MM-YYYY", "columns": ROW_ORDER}
 
 @app.post("/append")
 def append_row(payload: AppendRequest, x_api_key: Optional[str] = Header(None)):
     require_api_key(x_api_key)
-    if not payload.product:
-        raise HTTPException(422, "Field 'product' or 'products' is required.")
-
     svc = sheets_service()
+
+    date_str = payload.timestamp.strip() if payload.timestamp else _bg_today_str()
+    _validate_date_ddmmyyyy(date_str)
+
+    items_str = _norm_items_to_string(payload.items)
+    if not items_str:
+        raise HTTPException(422, detail="Задължително поле: консумативи (items).")
+
+    revenue_str = _validate_int_or_empty(payload.revenue)
+
     row = {
-        "timestamp": _bg_today_str(),
-        "location": payload.location.strip(),
-        "product": payload.product.strip(),
-        "quantity": "" if payload.quantity is None else str(payload.quantity),
-        "note": "" if not payload.note else str(payload.note).strip(),
-        "user": "" if not payload.user else str(payload.user).strip(),
+        COL["timestamp"]: date_str,
+        COL["location"]: payload.location.strip(),
+        COL["items"]: items_str,
+        COL["note"]: "" if not payload.note else str(payload.note).strip(),
+        COL["revenue"]: revenue_str,
     }
     values = [[row[k] for k in ROW_ORDER]]
     try:
         result = svc.spreadsheets().values().append(
             spreadsheetId=SHEET_ID,
-            range=a1_range_for_tab(TAB_NAME),
+            range=_sheet_range_all_cols(),
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
             body={"values": values},
         ).execute()
     except HttpError as e:
         raise HTTPException(502, detail=f"Google API error (append): {e}")
-    return {"ok": True, "appended": row, "update": result}
+    return {"ok": True, "row": row, "update": result}
 
-@app.get("/last-product")
+@app.get("/last-product")  # keeping path for compatibility; returns last consumables
 def last_product(location: str = Query(...), x_api_key: Optional[str] = Header(None)):
     require_api_key(x_api_key)
     svc = sheets_service()
@@ -210,34 +248,29 @@ def last_product(location: str = Query(...), x_api_key: Optional[str] = Header(N
         raise HTTPException(502, detail=f"Google API error (get): {e}")
 
     if not values or len(values) < 2:
-        raise HTTPException(404, "No data.")
-    for k in ROW_ORDER:
-        if k not in idx:
-            raise HTTPException(500, f"Sheet header must include: {ROW_ORDER}")
-
-    def ts(v):
-        try: return datetime.strptime(v, "%d-%m-%Y").timestamp()
-        except: return -1.0
+        raise HTTPException(404, "Няма данни.")
+    _require_header(idx)
 
     loc = location.strip().lower()
     rows = values[1:]
-    matches = [r for r in rows if len(r) > idx["location"] and r[idx["location"]].strip().lower() == loc]
+    matches = [r for r in rows if len(r) > idx[COL["location"]] and r[idx[COL["location"]]].strip().lower() == loc]
     if not matches:
-        raise HTTPException(404, f"No rows for location '{location}'.")
-    last_row = max(matches, key=lambda r: ts(r[idx["timestamp"]]))
-    def get(col):
-        return last_row[idx[col]] if idx[col] < len(last_row) else ""
-    # split comma list into array for convenience
-    products_raw = get("product") or ""
-    products = [p.strip() for p in products_raw.split(",") if p.strip()]
+        raise HTTPException(404, f"Няма редове за локация '{location}'.")
+
+    last_row = max(matches, key=lambda r: _ts_to_epoch_ddmmyyyy(r[idx[COL["timestamp"]]] if idx[COL["timestamp"]] < len(r) else ""))
+    def get(colkey):
+        c = COL[colkey]
+        return last_row[idx[c]] if idx[c] < len(last_row) else ""
+
+    items_raw = get("items") or ""
+    items = [p.strip() for p in items_raw.split(",") if p.strip()]
     return {
         "location": location,
         "timestamp": get("timestamp"),
-        "products": products,
-        "last_product": (products[-1] if products else ""),
-        "quantity": get("quantity"),
+        "items": items,
+        "last_item": (items[-1] if items else ""),
         "note": get("note"),
-        "user": get("user"),
+        "revenue": get("revenue"),
     }
 
 @app.post("/search")
@@ -251,29 +284,30 @@ def search_rows(filters: QueryFilters, x_api_key: Optional[str] = Header(None)):
 
     if not values or len(values) < 2:
         return {"rows": []}
-    for k in ROW_ORDER:
-        if k not in idx:
-            raise HTTPException(500, f"Sheet header must include: {ROW_ORDER}")
-
-    rows = values[1:]
+    _require_header(idx)
 
     def ok(r):
-        def get(col): return r[idx[col]] if idx[col] < len(r) else ""
+        def get(colkey):
+            c = COL[colkey]
+            return r[idx[c]] if idx[c] < len(r) else ""
         if filters.location and get("location").strip().lower() != filters.location.strip().lower():
             return False
-        if filters.product and get("product").strip().lower() != filters.product.strip().lower():
-            return False
+        if filters.product:
+            # exact token match (case-insensitive) in "Консумативи"
+            prod = filters.product.strip().lower()
+            tokens = [p.strip().lower() for p in (get("items") or "").split(",") if p.strip()]
+            if prod not in tokens:
+                return False
         if filters.since_ts or filters.until_ts:
-            try:
-                ts_val = datetime.strptime(get("timestamp"), "%d-%m-%Y").timestamp()
-            except:
+            ts_val = _ts_to_epoch_ddmmyyyy(get("timestamp"))
+            if ts_val < 0:
                 return False
             if filters.since_ts and ts_val < filters.since_ts: return False
             if filters.until_ts and ts_val > filters.until_ts: return False
         return True
 
     out = []
-    for i, r in enumerate(rows, start=2):  # row_number in the sheet
+    for i, r in enumerate(values[1:], start=2):
         if ok(r):
             obj = {col: (r[idx[col]] if idx[col] < len(r) else "") for col in ROW_ORDER}
             obj["row_number"] = i
@@ -284,40 +318,38 @@ def search_rows(filters: QueryFilters, x_api_key: Optional[str] = Header(None)):
 @app.post("/update-row")
 def update_row(patch: UpdateRowRequest, x_api_key: Optional[str] = Header(None)):
     """
-    Update any subset of fields on a specific row_number (>= 2).
-    Accepts product/products (string or list) and note/notes.
+    Частичен update на ред (row_number >= 2).
     """
     require_api_key(x_api_key)
     svc = sheets_service()
 
-    # Fetch existing row so we can merge partial updates
     try:
         values, idx = _get_values_and_index(svc)
     except HttpError as e:
         raise HTTPException(502, detail=f"Google API error (get): {e}")
     if not values or patch.row_number < 2 or patch.row_number > len(values):
-        raise HTTPException(404, f"Row {patch.row_number} not found.")
+        raise HTTPException(404, f"Ред {patch.row_number} не е намерен.")
+    _require_header(idx)
 
-    for k in ROW_ORDER:
-        if k not in idx:
-            raise HTTPException(500, f"Sheet header must include: {ROW_ORDER}")
-
-    existing = values[patch.row_number - 1]  # 0-based
-    # Build merged row dict aligned to header
+    existing = values[patch.row_number - 1]
     current: Dict[str, Any] = {k: (existing[idx[k]] if idx[k] < len(existing) else "") for k in ROW_ORDER}
 
-    # Apply patch (normalized fields already in patch.model)
-    if patch.timestamp is not None: current["timestamp"] = patch.timestamp
-    if patch.location  is not None: current["location"]  = patch.location
-    if patch.product   is not None: current["product"]   = patch.product
-    if patch.quantity  is not None: current["quantity"]  = str(patch.quantity)
-    if patch.note      is not None: current["note"]      = patch.note
-    if patch.user      is not None: current["user"]      = patch.user
+    if patch.timestamp is not None:
+        current[COL["timestamp"]] = _validate_date_ddmmyyyy(patch.timestamp.strip())
+    if patch.location is not None:
+        current[COL["location"]] = patch.location.strip()
+    if patch.items is not None:
+        items_str = _norm_items_to_string(patch.items)
+        if not items_str:
+            raise HTTPException(422, detail="Невалидни консумативи.")
+        current[COL["items"]] = items_str
+    if patch.note is not None:
+        current[COL["note"]] = str(patch.note).strip()
+    if patch.revenue is not None:
+        current[COL["revenue"]] = _validate_int_or_empty(patch.revenue)
 
-    # Compute the target range using the actual number of header columns
     last_col_letter = _col_letter(len(ROW_ORDER))
     a1 = f"{TAB_NAME}!A{patch.row_number}:{last_col_letter}{patch.row_number}"
-
     try:
         svc.spreadsheets().values().update(
             spreadsheetId=SHEET_ID,
@@ -328,57 +360,60 @@ def update_row(patch: UpdateRowRequest, x_api_key: Optional[str] = Header(None))
     except HttpError as e:
         raise HTTPException(502, detail=f"Google API error (update): {e}")
 
-    # Read-after-write verification; return the actual row contents
+    # read-after-write
     try:
-        new_values = svc.spreadsheets().values().get(
-            spreadsheetId=SHEET_ID,
-            range=f"{TAB_NAME}!A{patch.row_number}:{last_col_letter}{patch.row_number}"
+        new_vals = svc.spreadsheets().values().get(
+            spreadsheetId=SHEET_ID, range=a1
         ).execute().get("values", [[]])
     except HttpError as e:
         raise HTTPException(502, detail=f"Google API error (verify): {e}")
 
-    new_row = new_values[0] if new_values else []
-    # pad
-    if len(new_row) < len(ROW_ORDER):
-        new_row += [""] * (len(ROW_ORDER) - len(new_row))
-    returned = {ROW_ORDER[i]: new_row[i] for i in range(len(ROW_ORDER))}
-
-    return {"ok": True, "row_number": patch.row_number, "row": returned}
+    row = new_vals[0] if new_vals else []
+    if len(row) < len(ROW_ORDER):
+        row += [""] * (len(ROW_ORDER) - len(row))
+    returned = {ROW_ORDER[i]: row[i] for i in range(len(ROW_ORDER))}
+    returned["row_number"] = patch.row_number
+    return {"ok": True, "row": returned}
 
 @app.post("/delete-row")
 def delete_row(req: DeleteRowRequest, x_api_key: Optional[str] = Header(None)):
     """
-    Delete a specific row_number (>= 2).
+    Изтриване на конкретен ред (>= 2).
     """
     require_api_key(x_api_key)
     svc = sheets_service()
 
-    # Ensure row exists
     try:
         values, _ = _get_values_and_index(svc)
     except HttpError as e:
         raise HTTPException(502, detail=f"Google API error (get): {e}")
     if not values or req.row_number < 2 or req.row_number > len(values):
-        raise HTTPException(404, f"Row {req.row_number} not found.")
+        raise HTTPException(404, f"Ред {req.row_number} не е намерен.")
 
-    # Delete dimension requires numeric sheetId
     try:
-        sheet_id = _get_numeric_sheet_id(svc)
+        # physical delete (same as before)
+        meta = svc.spreadsheets().get(spreadsheetId=SHEET_ID).execute()
+        sheet_id = None
+        for sh in meta.get("sheets", []):
+            if sh["properties"]["title"] == TAB_NAME:
+                sheet_id = sh["properties"]["sheetId"]
+                break
+        if sheet_id is None:
+            raise HTTPException(500, "Tab not found to resolve sheetId.")
+
         svc.spreadsheets().batchUpdate(
             spreadsheetId=SHEET_ID,
             body={
-                "requests": [
-                    {
-                        "deleteDimension": {
-                            "range": {
-                                "sheetId": sheet_id,
-                                "dimension": "ROWS",
-                                "startIndex": req.row_number - 1,  # 0-based
-                                "endIndex": req.row_number        # exclusive
-                            }
+                "requests": [{
+                    "deleteDimension": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "dimension": "ROWS",
+                            "startIndex": req.row_number - 1,
+                            "endIndex": req.row_number
                         }
                     }
-                ]
+                }]
             }
         ).execute()
     except HttpError as e:
