@@ -45,6 +45,23 @@ app.add_middleware(
 
 # ------------------ helpers ------------------
 
+def _row_with_aliases(row_map: Dict[str, str]) -> Dict[str, Any]:
+    """
+    Add ASCII aliases to a BG-keyed row map so the assistant can aggregate.
+    Provides: timestamp, location, items_en, note_en, revenue (int).
+    """
+    out = dict(row_map)  # keep BG keys
+    out["timestamp"] = row_map.get(COL["timestamp"], "")
+    out["location"]  = row_map.get(COL["location"], "")
+    out["items_en"]  = row_map.get(COL["items"], "")
+    out["note_en"]   = row_map.get(COL["note"], "")
+    rev = row_map.get(COL["revenue"], "")
+    try:
+        out["revenue"] = int(str(rev).strip()) if str(rev).strip() != "" else 0
+    except:
+        out["revenue"] = 0
+    return out
+
 _sheet_id_cache: Optional[int] = None  # numeric sheet/tab id
 
 def _bg_today_str() -> str:
@@ -118,9 +135,13 @@ def _require_header(idx: Dict[str, int]):
 
 def _ts_to_epoch_ddmmyyyy(s: str) -> float:
     try:
-        return datetime.strptime(s, "%d-%m-%Y").timestamp()
+        return datetime.strptime(s, "%d-%м-%Y").timestamp()
     except Exception:
-        return -1.0
+        # fallback if locale char differs
+        try:
+            return datetime.strptime(s, "%d-%m-%Y").timestamp()
+        except Exception:
+            return -1.0
 
 # ------------ normalization (compat) ------------
 
@@ -137,7 +158,6 @@ def _norm_items_to_string(val: Optional[Union[str, List[str]]]) -> Optional[str]
 
 class AppendRequest(BaseModel):
     location: str
-    # new canonical
     items: Optional[Union[str, List[str]]] = None
     note: Optional[str] = None
     revenue: Optional[Union[int, str]] = Field(None, description="цяло число")
@@ -151,7 +171,6 @@ class AppendRequest(BaseModel):
     @root_validator(pre=True)
     def _merge_legacy(cls, v):
         if v.get("items") is None:
-            # prefer 'product'/'products'
             prod = v.get("product")
             prods = v.get("products")
             if prods is not None:
@@ -236,7 +255,8 @@ def append_row(payload: AppendRequest, x_api_key: Optional[str] = Header(None)):
         ).execute()
     except HttpError as e:
         raise HTTPException(502, detail=f"Google API error (append): {e}")
-    return {"ok": True, "row": row, "update": result}
+    # return with aliases so the assistant can aggregate revenue
+    return {"ok": True, "row": _row_with_aliases(row), "update": result}
 
 @app.get("/last-product")  # keeping path for compatibility; returns last consumables
 def last_product(location: str = Query(...), x_api_key: Optional[str] = Header(None)):
@@ -309,9 +329,9 @@ def search_rows(filters: QueryFilters, x_api_key: Optional[str] = Header(None)):
     out = []
     for i, r in enumerate(values[1:], start=2):
         if ok(r):
-            obj = {col: (r[idx[col]] if idx[col] < len(r) else "") for col in ROW_ORDER}
-            obj["row_number"] = i
-            out.append(obj)
+            obj_bg = {col: (r[idx[col]] if idx[col] < len(r) else "") for col in ROW_ORDER}
+            obj_bg["row_number"] = i
+            out.append(_row_with_aliases(obj_bg))
             if len(out) >= (filters.limit or 50): break
     return {"rows": out}
 
@@ -373,7 +393,8 @@ def update_row(patch: UpdateRowRequest, x_api_key: Optional[str] = Header(None))
         row += [""] * (len(ROW_ORDER) - len(row))
     returned = {ROW_ORDER[i]: row[i] for i in range(len(ROW_ORDER))}
     returned["row_number"] = patch.row_number
-    return {"ok": True, "row": returned}
+    # return with aliases so the assistant can aggregate revenue
+    return {"ok": True, "row": _row_with_aliases(returned)}
 
 @app.post("/delete-row")
 def delete_row(req: DeleteRowRequest, x_api_key: Optional[str] = Header(None)):
@@ -420,3 +441,55 @@ def delete_row(req: DeleteRowRequest, x_api_key: Optional[str] = Header(None)):
         raise HTTPException(502, detail=f"Google API error (delete): {e}")
 
     return {"ok": True, "deleted_row_number": req.row_number}
+
+# ------------------ NEW: sum revenue ------------------
+
+@app.get("/sum-revenue")
+def sum_revenue(
+    location: Optional[str] = Query(None, description="Filter by location (case-insensitive exact match)"),
+    since_ts: Optional[float] = Query(None, description="UNIX seconds inclusive lower bound"),
+    until_ts: Optional[float] = Query(None, description="UNIX seconds inclusive upper bound"),
+    x_api_key: Optional[str] = Header(None),
+):
+    require_api_key(x_api_key)
+    svc = sheets_service()
+
+    try:
+        values, idx = _get_values_and_index(svc)
+    except HttpError as e:
+        raise HTTPException(502, detail=f"Google API error (get): {e}")
+
+    if not values or len(values) < 2:
+        return {"total_revenue": 0, "rows": 0}
+
+    _require_header(idx)
+
+    def get_val(r, key):
+        col = COL[key]
+        return r[idx[col]] if idx[col] < len(r) else ""
+
+    total = 0
+    rows_count = 0
+
+    for r in values[1:]:
+        if location:
+            if get_val(r, "location").strip().lower() != location.strip().lower():
+                continue
+        if since_ts or until_ts:
+            try:
+                ts_val = datetime.strptime(get_val(r, "timestamp"), "%d-%m-%Y").timestamp()
+            except:
+                continue
+            if since_ts and ts_val < since_ts:
+                continue
+            if until_ts and ts_val > until_ts:
+                continue
+
+        rev_raw = get_val(r, "revenue")
+        try:
+            total += int(str(rev_raw).strip())
+        except:
+            pass
+        rows_count += 1
+
+    return {"total_revenue": total, "rows": rows_count}
