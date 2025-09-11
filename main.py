@@ -33,7 +33,7 @@ ROW_ORDER = [COL["timestamp"], COL["location"], COL["items"], COL["note"], COL["
 
 # ------------------ app ------------------
 
-app = FastAPI(title="Wonder Toys Sheets API (BG columns)", version="2.2.0")
+app = FastAPI(title="Wonder Toys Sheets API (BG columns)", version="2.2.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
@@ -74,24 +74,49 @@ def _excel_serial_to_epoch(serial: Union[int, float]) -> float:
     except Exception:
         return None  # type: ignore
 
+# Month names (EN + BG)
+MONTHS = {
+    # English
+    "january":1,"february":2,"march":3,"april":4,"may":5,"june":6,
+    "july":7,"august":8,"september":9,"october":10,"november":11,"december":12,
+    # Bulgarian
+    "януари":1,"февруари":2,"март":3,"април":4,"май":5,"юни":6,
+    "юли":7,"август":8,"септември":9,"октомври":10,"ноември":11,"декември":12,
+}
+
 _DATE_PATTERNS = [
     "%d-%m-%Y",
     "%d.%m.%Y",
     "%d/%m/%Y",
     "%Y-%m-%d",
+    "%d-%m-%y",
+    "%d.%m.%y",
+    "%d/%m/%y",
 ]
 
 def _cell_date_to_epoch(cell: Any) -> Optional[float]:
-    """Accept Excel serials or various string formats; return epoch seconds or None."""
+    """
+    Accept Excel serials, numeric date strings, and names like '1 март 2024' / '01 March 2024'.
+    Return epoch seconds (local midnight) or None if unparseable.
+    """
     if cell is None or cell == "":
         return None
-    # numeric serial?
+
+    # Excel date serial (with UNFORMATTED_VALUE)
     if isinstance(cell, (int, float)) and not isinstance(cell, bool):
         return _excel_serial_to_epoch(cell)
+
     s = str(cell).strip()
     if s == "":
         return None
-    # try patterns
+
+    # normalize thin/non-breaking spaces and strip trailing 'г.' (year) tokens
+    s = (s.replace("\u00A0", " ")
+         .replace("\u2009", " ")
+         .replace("\u202F", " "))
+    s = re.sub(r"\s*г\.?$", "", s, flags=re.IGNORECASE)  # remove Bulgarian 'г.' suffix
+
+    # Try common numeric patterns first
     for fmt in _DATE_PATTERNS:
         try:
             dt = datetime.strptime(s, fmt)
@@ -99,14 +124,31 @@ def _cell_date_to_epoch(cell: Any) -> Optional[float]:
             return dt.timestamp()
         except Exception:
             pass
-    # try to normalize separators (e.g., dd-mm-yyyy with mixed dash types)
+
+    # Try flexible separator normalization for numeric dates
     s2 = re.sub(r"[.\-/]", "-", s)
     try:
         dt = datetime.strptime(s2, "%d-%m-%Y")
         dt = datetime(dt.year, dt.month, dt.day, tzinfo=_tz)
         return dt.timestamp()
     except Exception:
-        return None
+        pass
+
+    # Month-name pattern: "1 март 2024" or "01 March 2024"
+    m = re.match(r"^\s*(\d{1,2})\s+([A-Za-zА-Яа-я]+)\s+(\d{4})\s*$", s)
+    if m:
+        day = int(m.group(1))
+        name = m.group(2).lower()
+        year = int(m.group(3))
+        month = MONTHS.get(name)
+        if month and 1 <= day <= 31:
+            try:
+                dt = datetime(year, month, day, tzinfo=_tz)
+                return dt.timestamp()
+            except Exception:
+                return None
+
+    return None
 
 def _row_with_aliases(row_map: Dict[str, Any]) -> Dict[str, Any]:
     """Add ASCII aliases so the assistant can aggregate."""
